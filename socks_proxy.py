@@ -30,6 +30,7 @@ import os
 import re
 import json
 import base64
+import http.client
 import socket
 import urllib.parse
 import urllib.request
@@ -112,6 +113,56 @@ def describe_node(link):
             f" security={n.get('security', '-')}")
 
 
+# ───────────────────── HTTP 传输：丢掉 Connection: close ─────────────────────
+#
+# ★ 2026-10 站点在【HTTP/1.1 + Connection: close】下会被边缘节点提前关闭连接
+#   （chunked 流被截断），响应体只到前几 KB 就断：
+#     - 登录页表现为表单缺失（input[name=identifier] 不存在）
+#     - 面板页表现为 http.client.IncompleteRead
+#   而 urllib 在 AbstractHTTPHandler.do_open() 里硬写
+#   headers["Connection"] = "close"（显式传 keep-alive 也会被覆盖），
+#   所以这里在连接层把这个头丢掉，回到 HTTP/1.1 默认的 keep-alive。
+#   实测：curl --http1.1 完整（44088B），加 -H 'Connection: close' 只剩 9230/8112B。
+
+class _NoConnectionClose:
+    """在 putheader 层丢弃 Connection 头（原因见上方注释）"""
+
+    def putheader(self, header, *values):
+        if header.lower() == "connection":
+            return
+        super().putheader(header, *values)
+
+
+class _KeepAliveHTTPSConnection(_NoConnectionClose, http.client.HTTPSConnection):
+    pass
+
+
+class _DirectHTTPSHandler(urllib.request.HTTPSHandler):
+    """直连模式：使用不发 Connection: close 的连接类"""
+
+    def https_open(self, req):
+        return self.do_open(_KeepAliveHTTPSConnection, req, context=self._context)
+
+
+def _socks_handler(socks, sockshandler, host, port):
+    """SOCKS 模式：同样丢弃 Connection: close
+    （sockshandler 的 do_open 走的也是同一份 stdlib 逻辑）"""
+
+    class _KeepAliveSocksConnectionS(_NoConnectionClose,
+                                     sockshandler.SocksiPyConnectionS):
+        pass
+
+    class _KeepAliveSocksHandler(sockshandler.SocksiPyHandler):
+        def https_open(self, req):
+            def build(host, port=None, timeout=0, **kwargs):
+                kw = sockshandler.merge_dict(self.kw, kwargs)
+                return _KeepAliveSocksConnectionS(
+                    *self.args, host=host, port=port, timeout=timeout, **kw)
+            return self.do_open(build, req)
+
+    return _KeepAliveSocksHandler(socks.SOCKS5, host, port, rdns=True)
+
+
 # ───────────────────── 代理启用 ─────────────────────
 
 _STATE = {"enabled": False, "endpoint": "", "why": "未初始化"}
@@ -183,7 +234,7 @@ def init(required=None):
     host, port = ep
     try:
         _OPENER = urllib.request.build_opener(
-            sockshandler.SocksiPyHandler(socks.SOCKS5, host, port, rdns=True))
+            _socks_handler(socks, sockshandler, host, port))
         ip = _probe(host, port)
     except Exception as e:
         msg = f"代理不可用（{type(e).__name__}: {str(e)[:80]}）"
@@ -200,8 +251,9 @@ def init(required=None):
 
 
 def get_opener():
-    """返回走代理的 opener；未启用则返回默认 opener"""
-    return _OPENER or urllib.request.build_opener()
+    """返回走代理的 opener；未启用代理则返回直连 opener
+    （两者都不发 Connection: close，见上方注释）"""
+    return _OPENER or urllib.request.build_opener(_DirectHTTPSHandler())
 
 
 def playwright_proxy():
