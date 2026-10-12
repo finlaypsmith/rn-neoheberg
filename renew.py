@@ -151,9 +151,13 @@ def vps_status(cookie):
 
 # ───────────────────────── cookie 刷新 ─────────────────────────
 #
-# ★ 2026-10 站点改版导致登录页 GET 返回【残缺 HTML】（无 </html>、无
-#   <form>/<input>，稳定停在同一长度），表单元素根本不存在 →
-#   page.fill 超时。这是服务端问题，脚本只能重试等它恢复。
+# ★ 登录页偶发【残缺 HTML】（无 </html>、无 <form>/<input>，表单元素不存在，
+#   page.fill 必然超时）有两类成因，都已定位：
+#     ① 客户端侧（本脚本每跑必中）：站点在 HTTP/1.1 + Connection: close 下
+#        提前关连接，而 urllib 硬写该头 —— 已在 socks_proxy.py 连接层去掉；
+#     ② 站点侧（2026-10-10 遇到一次，连走 HTTP/2 的浏览器也拿到残缺页）：
+#        只能等它自行恢复。
+#   保留重试仍有必要：429 限流、CDN 拦截页、站点抖动都要退避后再试。
 #   同时确认：① 登录是两步流程（identifier → #goToPassword → password）
 #            ② POST /login 需要 csrf_token
 #            ③ /login 有速率限制，连续请求返回 429
