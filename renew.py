@@ -170,7 +170,7 @@ def _backoff(attempt):
     return LOGIN_BACKOFF[i] if LOGIN_BACKOFF else 30
 
 
-def page_diag(page):
+def page_diag(page, resp=None):
     """登录失败时抓页面状态，便于判断是站点异常还是选择器问题"""
     d = {}
     try:
@@ -178,7 +178,6 @@ def page_diag(page):
         d["url"] = page.url
         d["title"] = page.title()[:60]
         d["html_len"] = len(html)
-        d["html_closed"] = "</html>" in html
         d["has_identifier"] = 'name="identifier"' in html
         d["has_password"] = 'name="password"' in html
         d["inputs"] = page.evaluate("() => document.querySelectorAll('input').length")
@@ -186,6 +185,18 @@ def page_diag(page):
         d["rate_limited"] = "Trop de requ" in html
     except Exception as e:
         d["error"] = f"{type(e).__name__}: {str(e)[:80]}"
+        return d
+
+    # ★ 不能用 page.content() 判断响应体是否完整：它返回的是【浏览器序列化后的
+    #   DOM】，HTML 解析器会自动补全 </body></html>，那里 "</html>" 恒为真。
+    #   要判断截断只能看原始响应体；resp 与当前页面不是同一次导航时跳过。
+    if resp is not None and resp.url == d.get("url"):
+        try:
+            raw = resp.text()
+            d["raw_len"] = len(raw)
+            d["raw_closed"] = "</html>" in raw
+        except Exception:
+            pass
     return d
 
 
@@ -194,9 +205,32 @@ def diag_str(d):
         return "(无)"
     if "error" in d and len(d) == 1:
         return d["error"]
-    parts = [f"{k}={d[k]}" for k in ("url", "html_len", "inputs", "cap_widget",
-                                     "html_closed", "has_identifier") if k in d]
+    parts = [f"title={d['title']!r}"] if "title" in d else []
+    keys = ("url", "html_len", "raw_len", "raw_closed", "inputs", "cap_widget",
+            "has_identifier")
+    parts += [f"{k}={d[k]}" for k in keys if k in d]
     return " ".join(parts)
+
+
+def _diag_hint(d):
+    """把最后一次失败的诊断翻译成一句人能看懂的结论。
+
+    ★ 只有确认【原始响应体不完整】(raw_closed=False) 才能断言是站点截断：
+      429 页、CDN 拦截页同样没有 identifier，凭 has_identifier=False 一概而论
+      会把「限流」「被拦」误报成「站点坏了」。
+    """
+    if not d:
+        return ""
+    if d.get("raw_closed") is False:
+        return ("（登录页响应体不完整：raw_len="
+                f"{d.get('raw_len', '?')}、无 </html> —— "
+                "站点 GET /login 返回残缺 HTML，非本脚本问题；等站点恢复）")
+    if d.get("rate_limited"):
+        return "（站点返回 429 速率限制；稍后再试或降低触发频率）"
+    if d.get("raw_closed") is True and not d.get("has_identifier", True):
+        return (f"（响应体完整但没有登录表单，页面标题 {d.get('title', '?')!r} —— "
+                "可能是 CDN 拦截页或页面结构已变，不是站点截断）")
+    return ""
 
 
 def read_csrf(page):
@@ -254,10 +288,7 @@ def refresh_cookie():
             log("    站点返回 429（速率限制），拉长退避")
             time.sleep(30)
 
-    hint = ""
-    if last_diag and not last_diag.get("has_identifier", True):
-        hint = ("（登录页表单缺失 —— 站点 GET /login 返回残缺 HTML，"
-                "非本脚本问题；等站点恢复）")
+    hint = _diag_hint(last_diag)
     return None, f"{LOGIN_ATTEMPTS} 次尝试均失败，最后错误: {last_msg}{hint}"
 
 
@@ -292,13 +323,14 @@ def _login_once(sync_playwright, pw):
             user_agent=UA, viewport={"width": 1920, "height": 1080}, locale="fr-FR")
         page = ctx.new_page()
         try:
-            page.goto(BASE + "/login", timeout=60000, wait_until="domcontentloaded")
+            resp = page.goto(BASE + "/login", timeout=60000,
+                             wait_until="domcontentloaded")
 
             # ★ 先等表单出现 —— 站点残缺 HTML 时这里就会失败（不再盲填）
             try:
                 page.wait_for_selector('input[name="identifier"]', timeout=45000)
             except Exception:
-                diag = page_diag(page)
+                diag = page_diag(page, resp)
                 return None, "登录表单未渲染（input[name=identifier] 不存在）", diag
 
             page.fill('input[name="identifier"]', USERNAME)
@@ -309,7 +341,7 @@ def _login_once(sync_playwright, pw):
             try:
                 page.wait_for_selector('input[name="password"]', timeout=25000)
             except Exception:
-                diag = page_diag(page)
+                diag = page_diag(page, resp)
                 return None, "第二步密码框未出现（#goToPassword 跳转失败）", diag
 
             page.evaluate("() => { const w=document.getElementById('cap-login'); if (w) w.solve(); }")
@@ -356,7 +388,7 @@ def _login_once(sync_playwright, pw):
                     cand[c["name"]] = c["value"]
 
             if "__Host-NH-Remember" not in cand:
-                diag = page_diag(page)
+                diag = page_diag(page, resp)
                 # 站点是否给了明确的错误提示
                 try:
                     err = page.evaluate("""() => {
@@ -438,15 +470,16 @@ def selftest():
             ctx = browser.new_context(user_agent=UA, viewport={"width": 1920, "height": 1080},
                                       locale="fr-FR")
             page = ctx.new_page()
-            page.goto(BASE + "/login", timeout=60000, wait_until="domcontentloaded")
+            resp = page.goto(BASE + "/login", timeout=60000,
+                             wait_until="domcontentloaded")
 
             # ★ 与主流程一致：先等表单渲染，再判断站点是否正常
             try:
                 page.wait_for_selector('input[name="identifier"]', timeout=45000)
             except Exception:
-                d = page_diag(page)
+                d = page_diag(page, resp)
                 log(f"❌ 登录表单未渲染 —— {diag_str(d)}")
-                log("   若 html_closed=False / inputs=0：站点 GET /login 返回残缺 HTML（服务端问题）")
+                log("   若 raw_closed=False / inputs=0：站点 GET /login 返回残缺 HTML（服务端问题）")
                 browser.close()
                 return 1
 
@@ -521,6 +554,7 @@ def main():
         log("无头浏览器登录…")
         cookie, msg = refresh_cookie()
         if not cookie:
+            log(f"登录失败: {msg}")
             # 区分「站点异常」与「脚本/凭证问题」，便于判断要不要人工介入
             if "表单缺失" in msg or "残缺 HTML" in msg:
                 notify(f"⚠️ NeoHeberg 登录失败（站点侧问题）\n"
@@ -530,7 +564,6 @@ def main():
                        f"建议：等站点修复后自动恢复，或手动到面板续期。")
             else:
                 notify(f"❌ NeoHeberg 任务失败：登录失败\n原因: {msg}")
-            log(f"登录失败: {msg}")
             return 1
         log("登录成功")
         actions.append("无头登录成功")
@@ -541,12 +574,14 @@ def main():
     try:
         csrf, dash = panel_csrf(cookie)
     except Exception as e:
+        log(f"面板读取失败: {type(e).__name__}: {str(e)[:150]}")
         notify(f"❌ NeoHeberg: 面板读取失败 {type(e).__name__}: {str(e)[:150]}")
         return 1
 
     exp, days = parse_expiry(dash)
     log(f"到期日: {exp}  剩余: {days} 天")
     if csrf is None:
+        log("未取到 CSRF token")
         notify("❌ NeoHeberg: 未取到 CSRF token")
         return 1
 
@@ -612,6 +647,7 @@ def main():
             f"代理: {socks_proxy.describe()}")
     if RUN_URL:
         text += f"\n{RUN_URL}"
+    log(f"汇总: 到期={exp2} (剩 {days2} 天)  容器={status}")
     notify(text)
 
     log("完成")
